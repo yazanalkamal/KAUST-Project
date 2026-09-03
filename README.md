@@ -82,7 +82,7 @@ KAUST-Project/
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/POGYaz/KAUST-Project
+git clone https://github.com/yazanalkamal/KAUST-Project
 cd KAUST-Project
 ```
 
