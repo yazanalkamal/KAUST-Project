@@ -73,7 +73,7 @@ def make_feature_tensors(
     feats = feature_builder.build_features(
         df, user_emb, item_emb, pop, price, device=str(device), batch_size=1024,
     )
-    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z"]
+    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z", "retr_rr"]
     # Stack features into (Q, K, F) then flatten to (Q*K, F)
     X_np = np.stack([feats[c] for c in cols], axis=-1)
     X_np = X_np.reshape(-1, X_np.shape[-1])
@@ -114,17 +114,30 @@ class ValRecallCallback:
         return None
 
     def on_epoch_end(self, epoch: int, logs=None) -> bool:
+        was_training = self.model.training
+        self.model.eval()
         with torch.no_grad():
             scores = self.model(self.X_val_flat).view(self.batch_count, self.k_per_q).cpu()
+        if was_training:
+            self.model.train()
         # Labels shaped (B,K2) with exactly one positive per row
         y = self.y_val_flat.view(self.batch_count, self.k_per_q).cpu()
         topk_idx = torch.topk(scores, k=min(self.topk, self.k_per_q), dim=1).indices
-        # For each row, check if any top-k position corresponds to label==1
         rows = torch.arange(self.batch_count).unsqueeze(1)
-        hits = (y[rows, topk_idx] > 0.5).any(dim=1).float().mean().item()
-        rec = float(hits)
-        logging.getLogger(__name__).info(f"Epoch {epoch+1}: val_recall@{self.topk}={rec:.4f}")
-        # Do not stop training
+        hit = (y[rows, topk_idx] > 0.5).any(dim=1).float()
+        rec = float(hit.mean().item())
+        # NDCG with a single relevant item: 1/log2(rank+1).
+        pos_rank = (y[rows, topk_idx] > 0.5).float().argmax(dim=1) + 1
+        ndcg = float((hit / torch.log2(pos_rank.float() + 1.0)).mean().item())
+        logging.getLogger(__name__).info(
+            f"Epoch {epoch+1}: val_recall@{self.topk}={rec:.4f} val_ndcg@{self.topk}={ndcg:.4f}"
+        )
+        # Publish into the shared log dict so ModelCheckpoint and EarlyStopping
+        # can select on ranking quality instead of BCE loss. This callback is
+        # registered first so the metric is present when they run.
+        if logs is not None:
+            logs[f"val_recall@{self.topk}"] = rec
+            logs[f"val_ndcg@{self.topk}"] = ndcg
         return False
 
 
@@ -213,7 +226,7 @@ def main() -> None:
         n_negatives_per_query=None,
     )
     feats_val = val_feat_builder.build_features(cand["val"], user_emb, item_emb, pop, price, device=str(device), batch_size=1024)
-    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z"]
+    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z", "retr_rr"]
     X_va_np = np.stack([feats_val[c] for c in cols], axis=-1)
     X_va_np = X_va_np.reshape(-1, X_va_np.shape[-1])
     y_va_np = feats_val["label"].reshape(-1)
@@ -235,7 +248,7 @@ def main() -> None:
     # Model
     model_cfg = cfg.get("model", {})
     model = MLPRanker(
-        input_dim=model_cfg.get("input_dim", 5),
+        input_dim=model_cfg.get("input_dim", 6),
         hidden_dims=model_cfg.get("hidden_dims", [384, 384, 192]),
         dropout=model_cfg.get("dropout", 0.3),
         feature_dropout_indices=(model_cfg.get("feature_dropout", {}).get("feature_indices", [0]) if model_cfg.get("feature_dropout", {}).get("enabled", True) else None),
@@ -258,16 +271,23 @@ def main() -> None:
         mixed_precision=(device.type == "cuda" and cfg.get("training", {}).get("mixed_precision", True)),
     )
 
-    # Callbacks
-    # Notebook default: save best to models/reranker/best_ranker.pt
-    ckpt = ModelCheckpoint(filepath=model_dir / "best_ranker.pt", monitor="val_loss", mode="min", save_best_only=True, save_weights_only=True)
-    ckpt.set_model(model)
-    trainer.add_callback(ckpt)
-    trainer.add_callback(EarlyStopping(monitor="val_loss", patience=cfg.get("training", {}).get("patience", 5), mode="min"))
-    trainer.add_callback(MetricsLogger(save_path=model_dir / "training_metrics.json", save_frequency=5))
-    # Add validation Recall@K printer (fast, precomputed features)
+    # Callbacks. Registration order matters: the ranking metric must be computed
+    # and written into the epoch logs before checkpointing and early stopping
+    # read it, so ValRecallCallback is registered first.
     eval_topk = int(cfg.get("evaluation", {}).get("eval_topk", 10))
     trainer.add_callback(ValRecallCallback(model, X_va, y_va, batch_count_va, k_per_q_va, device, topk=eval_topk))
+
+    ckpt_cfg = cfg.get("checkpointing", {})
+    monitor = ckpt_cfg.get("monitor", f"val_recall@{eval_topk}")
+    mode = ckpt_cfg.get("mode", "max")
+    ckpt = ModelCheckpoint(filepath=model_dir / "best_ranker.pt", monitor=monitor, mode=mode,
+                           save_best_only=True, save_weights_only=True)
+    ckpt.set_model(model)
+    trainer.add_callback(ckpt)
+    trainer.add_callback(EarlyStopping(monitor=monitor, mode=mode,
+                                       patience=cfg.get("training", {}).get("patience", 5)))
+    trainer.add_callback(MetricsLogger(save_path=model_dir / "training_metrics.json", save_frequency=5))
+    logging.getLogger(__name__).info(f"Selecting the checkpoint on {monitor} ({mode})")
 
     # Train
     epochs = int(cfg.get("training", {}).get("epochs", 20))

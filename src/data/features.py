@@ -415,6 +415,7 @@ class RankingFeatureBuilder:
             'pop': [],
             'hist_len': [],
             'price_z': [],
+            'retr_rr': [],
             'label': [],
             'item_idx': [],
         }
@@ -581,6 +582,14 @@ class RankingFeatureBuilder:
         else:
             price_z = torch.zeros((B, K), device=candidate_tensor.device)
         
+        # Feature 6: first-stage retrieval rank, as a discounted reciprocal rank.
+        # Candidate lists are stored best-first, so a candidate's position in the
+        # list is the retriever's ranking of it. Without this the reranker cannot
+        # see the first-stage score and reorders candidates blind, which loses
+        # more ranking quality than its own five features recover.
+        ranks = torch.arange(K, device=candidate_tensor.device, dtype=torch.float32)
+        retr_rr = (1.0 / torch.log2(ranks + 2.0)).unsqueeze(0).expand(B, K).contiguous()
+
         # Labels: 1 for positive items, 0 for negatives
         labels = (candidate_tensor == positive_tensor.view(-1, 1)).float()
         
@@ -590,6 +599,7 @@ class RankingFeatureBuilder:
             'pop': pop,
             'hist_len': hist_len,
             'price_z': price_z,
+            'retr_rr': retr_rr,
             'label': labels,
             'item_idx': candidate_tensor.float(),
         }

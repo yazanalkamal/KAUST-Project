@@ -6,7 +6,7 @@ model:
   type: "mlp"  # "mlp", "dcn", "wide_deep"
   
   # Input feature dimension (will be set based on feature builder)
-  input_dim: 5  # dot_uv, max_sim_recent, pop, hist_len, price_z
+  input_dim: 6  # dot_uv, max_sim_recent, pop, hist_len, price_z, retr_rr
   
   # Hidden layer dimensions
   hidden_dims: [384, 384, 192]
@@ -90,6 +90,7 @@ features:
     - "pop"
     - "hist_len"
     - "price_z"
+    - "retr_rr"
 
 # Candidate generation configuration
 candidates:
