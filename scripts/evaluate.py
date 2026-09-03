@@ -4,38 +4,45 @@ Evaluate the saved Jarir recommender artifacts on the val and test splits.
 
 Everything is computed from artifacts already on disk; nothing is trained or
 tuned here:
-  - models/retriever/user_embeddings.npy, item_embeddings.npy
-  - models/reranker/ranker_best.pt   (notebook 04 "RankerMLP" layout: fc1/fc2/fc3)
   - models/data/*.parquet            (sequences, candidates, id maps, catalog)
+  - models/reranker/best_ranker.pt   (src MLPRanker, written by train_reranker.py)
+  - models/retriever/*.npy           (Two-Tower embeddings, for rows B/C and the
+                                      reranker dot_uv / max_sim_recent features)
 
-Rows reported per split (all with Recall@10 / NDCG@10; one relevant item per
-query, so Recall@10 is a hit rate and NDCG@10 is 1/log2(rank+1) when hit):
+Every row is Recall@10 / NDCG@10 with one relevant item per query, so Recall@10
+is a hit rate and NDCG@10 is 1/log2(rank+1) when hit. The "ranked set" column
+is the denominator, and it is the number to read first: a metric over 200
+candidates is not comparable to one over the whole catalogue.
 
-  A  Popularity: the 10 most purchased items (purchase lines in
-     interactions_clean.parquet dated before the first timestamp of the split),
-     the same list for every query.                        Ranked set: all items.
-  B  Retriever, user-ID embedding: user_embeddings[user_idx] . item_embeddings
-                                                            Ranked set: all items.
-  C  Retriever, history-mean embedding (the vector used by
-     scripts/build_candidates.py, notebook 04 and the app). Ranked set: all items.
-  D  Full pipeline: C retrieves --cand-k candidates (no positive injection),
-     ranker_best.pt reranks them with notebook-04 features (real popularity and
-     price_z), top 10 kept.                                 Ranked set: all items.
-  E  Same as D but with the popularity and price_z features zeroed, which is
-     what app/streamlit_app.py feeds the reranker.          Ranked set: all items.
-  F  Reranker over the saved candidates_<split>.parquet lists (100 candidates,
-     positive force-inserted into every list). This is the protocol of the
-     eval_reranked() function in notebook 04.
-                                             Ranked set: 100 candidates, positive
-                                             guaranteed present.
-  G  Reranker over the fresh --cand-k candidates from D, restricted to the
-     queries where the retriever actually returned the positive.
-                                             Ranked set: --cand-k candidates,
-                                             positive present by construction.
+  A   Popularity: the 10 items with the most purchase lines dated before the
+      split starts, the same list for every query.        Ranked set: all items.
+  A2  Repeat purchase: the customer's own recent distinct items, oldest dropped
+      first, padded with A.                                Ranked set: all items.
+  A3  ItemKNN retriever: item-item cosine over the purchase matrix, refitted per
+      query date on purchases strictly before it.          Ranked set: all items.
+  B   Two-Tower retriever using the user-ID embedding.     Ranked set: all items.
+  C   Two-Tower retriever using the history-mean embedding.Ranked set: all items.
+  D   Full pipeline: --retriever retrieves --cand-k candidates, the reranker
+      scores them, top 10 kept.                            Ranked set: all items.
+  E   Hybrid: the customer's recent items first, then D.   Ranked set: all items.
+  F   Reranker over the saved candidates_<split>.parquet lists.
+                                          Ranked set: the stored candidate list.
+  G   Reranker over freshly retrieved candidates, restricted to the queries
+      where the retriever actually returned the positive.
+                                          Ranked set: --cand-k candidates.
+  G0  The same queries as G in the retriever's own order, with no reranking.
+      G below G0 means the reranker is destroying ranking quality.
+                                          Ranked set: --cand-k candidates.
+
+Rows F and G are candidate-restricted and will always look better than rows over
+the catalogue. The README once quoted a row-F-style number (~0.69) as the
+system's performance, at a time when the ground-truth item was inserted into
+every candidate list. The diagnostics under the table report how many lists had
+the positive inserted rather than retrieved.
 
 Usage:
     python scripts/evaluate.py
-    python scripts/evaluate.py --cand-k 100 --splits val test
+    python scripts/evaluate.py --retriever two_tower --cand-k 100 --splits val test
 """
 
 import argparse
@@ -51,19 +58,24 @@ import torch
 import torch.nn as nn
 
 from src.data.dataset import load_id_mappings, load_processed_sequences, parse_history_string
-from src.data.features import RankingFeatureBuilder
+from src.data.features import RankingFeatureBuilder, build_item_side_features, positive_in_candidates
 from src.evaluation.metrics import ndcg_at_k, recall_at_k
 from src.inference.ann_index import build_index_from_embeddings
+from src.inference.item_knn import interactions_with_item_idx, time_aware_topk
+from src.models.reranker.mlp_ranker import MLPRanker
+from src.utils.config import load_config
 from src.utils.io import read_numpy, read_parquet
 from src.utils.seed import set_seed
 
-FEATURE_COLS = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z"]
+FEATURE_COLS = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z", "retr_rr"]
 MAX_HIST = 15
 
 
 # --------------------------------------------------------------------------- #
-# Reranker architecture matching models/reranker/ranker_best.pt
-# (notebook 04 / app/streamlit_app.py "RankerMLP"; dropout is inert in eval)
+# Reranker checkpoints. Two layouts exist:
+#   - src MLPRanker (scripts/train_reranker.py -> best_ranker.pt), keys "layers.*"
+#   - legacy notebook-04 "RankerMLP" (ranker_best.pt), keys "fc1.*"; kept so the
+#     old checkpoint can still be evaluated.
 # --------------------------------------------------------------------------- #
 class RankerMLP(nn.Module):
     def __init__(self, d_in: int = 5, hidden: int = 384, dropout: float = 0.3):
@@ -84,9 +96,23 @@ class RankerMLP(nn.Module):
         return self.out(h).squeeze(-1)
 
 
-def load_ranker(path: Path) -> RankerMLP:
+def load_ranker(path: Path, config_path: Path = Path("configs/reranker.yaml")) -> nn.Module:
     state = torch.load(path, map_location="cpu", weights_only=True)
-    model = RankerMLP()
+    if "layers.0.weight" in state:
+        model_cfg = load_config(config_path).get("model", {}) if config_path.exists() else {}
+        fd = model_cfg.get("feature_dropout", {})
+        model = MLPRanker(
+            input_dim=model_cfg.get("input_dim", 6),
+            hidden_dims=model_cfg.get("hidden_dims", [384, 384, 192]),
+            dropout=model_cfg.get("dropout", 0.3),
+            feature_dropout_indices=(fd.get("feature_indices", [0]) if fd.get("enabled", True) else None),
+            feature_dropout_prob=fd.get("dropout_prob", 0.3),
+            use_residual=model_cfg.get("use_residual", True),
+            use_layer_norm=model_cfg.get("use_layer_norm", True),
+            activation=model_cfg.get("activation", "relu"),
+        )
+    else:
+        model = RankerMLP()
     model.load_state_dict(state, strict=True)
     model.eval()
     return model
@@ -109,26 +135,27 @@ def history_mean_vectors(item_emb: np.ndarray, histories: List[List[int]]) -> np
     return out
 
 
-def notebook_pop_and_price(
-    seq_train: pd.DataFrame, items_clean: pd.DataFrame, item_map: pd.DataFrame, n_items: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Recreate the pop and price_z feature vectors exactly as notebook 04 built them."""
-    pop_counts = seq_train["pos_item_idx"].value_counts()
-    pop_norm = (pop_counts - pop_counts.min()) / (pop_counts.max() - pop_counts.min() + 1e-9)
-    pop_vec = np.zeros(n_items, dtype=np.float32)
-    pop_vec[pop_counts.index.values.astype(int)] = pop_norm.loc[pop_counts.index].values.astype(np.float32)
-
-    price_z = np.zeros(n_items, dtype=np.float32)
-    m = items_clean[["stock_code", "price_median"]].dropna().merge(item_map, on="stock_code", how="inner")
-    if len(m) > 0:
-        mu, sigma = m["price_median"].mean(), m["price_median"].std() + 1e-6
-        z = ((m["price_median"] - mu) / sigma).astype(float)
-        price_z[m["item_idx"].astype(int).values] = z.values.astype(np.float32)
-    return pop_vec, price_z
+def repeat_purchase_lists(hists: List[List[int]], pop_top: List[int], k: int) -> List[List[int]]:
+    """Most recent distinct history items first, padded with the popularity list."""
+    out = []
+    for h in hists:
+        seen, rec = set(), []
+        for it in reversed(h):
+            if it not in seen:
+                seen.add(it)
+                rec.append(it)
+        for it in pop_top:
+            if len(rec) >= k:
+                break
+            if it not in seen:
+                seen.add(it)
+                rec.append(it)
+        out.append(rec[:k])
+    return out
 
 
 def rerank_lists(
-    model: RankerMLP,
+    model: nn.Module,
     cand_df: pd.DataFrame,
     item_emb: np.ndarray,
     pop_vec: np.ndarray,
@@ -181,10 +208,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate saved retriever / reranker artifacts")
     p.add_argument("--data-dir", default="models/data")
     p.add_argument("--retriever-dir", default="models/retriever")
-    p.add_argument("--ranker", default="models/reranker/ranker_best.pt")
+    p.add_argument("--ranker", default="models/reranker/best_ranker.pt")
     p.add_argument("--splits", nargs="+", default=["val", "test"], choices=["train", "val", "test"])
     p.add_argument("--k", type=int, default=10, help="Cut-off for Recall@K / NDCG@K")
     p.add_argument("--cand-k", type=int, default=200, help="Candidates retrieved before reranking")
+    p.add_argument("--retriever", default="item_knn", choices=["item_knn", "two_tower"],
+                   help="Candidate generator for the full pipeline (rows D-G)")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -235,8 +264,7 @@ def main() -> None:
     assert user_emb.shape[0] == n_users and item_emb.shape[0] == n_items, "embedding / id-map size mismatch"
     ranker = load_ranker(Path(args.ranker))
     index = build_index_from_embeddings(item_emb, index_type="flat", metric="cosine")  # exact search
-    pop_vec, price_z = notebook_pop_and_price(seqs["train"], items_clean, item_map, n_items)
-    zeros = np.zeros(n_items, dtype=np.float32)
+    pop_vec, price_z = build_item_side_features(seqs["train"], items_clean, item_map, n_items)
 
     print()
     print(f"user_embeddings {user_emb.shape}, item_embeddings {item_emb.shape}, "
@@ -262,6 +290,18 @@ def main() -> None:
         rows.append((split, "A", "Popularity top-10 (purchase lines before split start), same list for all",
                      f"all {n_items} items", n, *metrics(preds_A, gt, K)))
 
+        # A2. repeat purchase: the customer's own recent items, padded with popularity
+        preds_A2 = repeat_purchase_lists(hists, pop_top, K)
+        rows.append((split, "A2", "Repeat purchase: recent distinct history items, then popularity",
+                     f"all {n_items} items", n, *metrics(preds_A2, gt, K)))
+
+        # A3. ItemKNN, fitted on purchases strictly before each query's date
+        big_k = max(args.cand_k, 200)
+        idx_knn_big = time_aware_topk(inter_idx, df["ts"].tolist(), hists, n_items, big_k)
+        preds_A3 = idx_knn_big[:, :K].tolist()
+        rows.append((split, "A3", "ItemKNN retriever (recency-weighted, fit on purchases before query date)",
+                     f"all {n_items} items", n, *metrics(preds_A3, gt, K)))
+
         # B. retriever with user-ID embedding
         _, idx_B = index.search(user_emb[users], k=K)
         preds_B = idx_B.tolist()
@@ -270,54 +310,66 @@ def main() -> None:
 
         # C. retriever with history-mean embedding
         U = history_mean_vectors(item_emb, hists)
-        _, idx_C_big = index.search(U, k=max(args.cand_k, 200))
+        _, idx_C_big = index.search(U, k=big_k)
         preds_C = idx_C_big[:, :K].tolist()
-        rows.append((split, "C", "Retriever, history-mean embedding (candidate-gen / app path)",
+        rows.append((split, "C", "Two-Tower retriever, history-mean embedding",
                      f"all {n_items} items", n, *metrics(preds_C, gt, K)))
         in_hist = float(np.mean([g in h for g, h in zip(gt, hists)]))
-        r100 = recall_at_k(idx_C_big[:, :100].tolist(), gt, 100)
-        r200 = recall_at_k(idx_C_big[:, :200].tolist(), gt, 200)
         diag.append(f"[{split}] positive item already in the query history: {in_hist:.1%} of queries")
-        diag.append(f"[{split}] history-mean retriever candidate recall: Recall@100={r100:.4f}, Recall@200={r200:.4f}")
+        for name, big in (("Two-Tower history-mean", idx_C_big), ("ItemKNN", idx_knn_big)):
+            r100 = recall_at_k(big[:, :100].tolist(), gt, 100)
+            r200 = recall_at_k(big[:, :200].tolist(), gt, 200)
+            diag.append(f"[{split}] {name} candidate recall: Recall@100={r100:.4f}, Recall@200={r200:.4f}")
 
         # D. full pipeline: retrieve cand_k (no injection) -> rerank -> top K
-        cand_idx = idx_C_big[:, : args.cand_k]
+        cand_big = idx_knn_big if args.retriever == "item_knn" else idx_C_big
+        retr_name = "ItemKNN" if args.retriever == "item_knn" else "Two-Tower"
+        cand_idx = cand_big[:, : args.cand_k]
         cand_df = make_cand_df(df, cand_idx)
         preds_D = rerank_lists(ranker, cand_df, item_emb, pop_vec, price_z, K)
-        rows.append((split, "D", f"Full pipeline: C retrieves {args.cand_k} -> ranker_best.pt (notebook features) -> top {K}",
+        rows.append((split, "D", f"Pipeline: {retr_name} retrieves {args.cand_k} -> {Path(args.ranker).name} -> top {K}",
                      f"all {n_items} items", n, *metrics(preds_D, gt, K)))
 
-        # E. full pipeline with the zeroed pop / price_z features used by the app
-        preds_E = rerank_lists(ranker, cand_df, item_emb, zeros, zeros, K)
-        rows.append((split, "E", "Full pipeline as served by app (pop=0, price_z=0 features)",
+        # E. hybrid: the customer's own recent items first, then the pipeline's picks
+        preds_E = [r[:K] for r in (
+            [it for it in rp if it in set(h)] + [it for it in d if it not in set(h)]
+            for rp, d, h in zip(preds_A2, preds_D, hists)
+        )]
+        rows.append((split, "E", "Hybrid: recent history items first, then pipeline picks",
                      f"all {n_items} items", n, *metrics(preds_E, gt, K)))
 
-        # F. reranker over the saved candidate lists (positive force-inserted)
+        # F. reranker over the saved candidate lists in models/data
         if cand_files[split].exists():
             saved = read_parquet(cand_files[split])
             assert len(saved) == n, "candidates file / sequences length mismatch"
             kk = int(saved["cands"].str.split().str.len().iloc[0])
+            present = positive_in_candidates(saved)
             preds_F = rerank_lists(ranker, saved, item_emb, pop_vec, price_z, K)
             gt_F = saved["pos_item_idx"].astype(int).tolist()
-            rows.append((split, "F", f"Reranker over saved candidates_{split}.parquet (notebook-04 protocol)",
-                         f"{kk} cands, positive force-inserted", n, *metrics(preds_F, gt_F, K)))
-            # Was the positive genuinely retrieved (in fresh top-100) or force-inserted?
-            fresh100 = idx_C_big[:, :100].tolist()
-            injected = np.array([g not in row for g, row in zip(gt_F, fresh100)])
+            rows.append((split, "F", f"Reranker over saved candidates_{split}.parquet",
+                         f"{kk} cands, positive present in {present.mean():.0%}", n, *metrics(preds_F, gt_F, K)))
+            # Was the positive genuinely retrieved (in fresh top-kk) or inserted into the file?
+            fresh = cand_big[:, :kk].tolist()
+            injected = np.array([g not in row for g, row in zip(gt_F, fresh)]) & present
             hit_F = np.array([g in p for g, p in zip(gt_F, preds_F)])
-            r_inj = hit_F[injected].mean() if injected.any() else float("nan")
-            r_ret = hit_F[~injected].mean() if (~injected).any() else float("nan")
-            diag.append(f"[{split}] row F breakdown: positive force-inserted in {injected.mean():.1%} of lists "
-                        f"(hit rate {r_inj:.4f}, n={int(injected.sum())}); positive genuinely retrieved in "
-                        f"{(~injected).mean():.1%} (hit rate {r_ret:.4f}, n={int((~injected).sum())})")
+            if injected.any():
+                r_inj = hit_F[injected].mean()
+                r_ret = hit_F[present & ~injected].mean() if (present & ~injected).any() else float("nan")
+                diag.append(f"[{split}] row F breakdown: positive force-inserted in {injected.mean():.1%} of lists "
+                            f"(hit rate {r_inj:.4f}, n={int(injected.sum())}); positive genuinely retrieved in "
+                            f"{(present & ~injected).mean():.1%} (hit rate {r_ret:.4f}, n={int((present & ~injected).sum())})")
 
         # G. reranker over fresh candidates, only queries where the positive was retrieved
         hit_mask = np.array([g in row for g, row in zip(gt, cand_idx.tolist())])
         if hit_mask.any():
             preds_G = [p for p, m in zip(preds_D, hit_mask) if m]
             gt_G = [g for g, m in zip(gt, hit_mask) if m]
-            rows.append((split, "G", f"Reranker over fresh {args.cand_k} cands, queries where positive was retrieved",
+            rows.append((split, "G", f"Reranker over fresh {retr_name} {args.cand_k} cands, queries where positive was retrieved",
                          f"{args.cand_k} cands, positive present", int(hit_mask.sum()), *metrics(preds_G, gt_G, K)))
+            # Same queries, retriever's own order: does the reranker beat it?
+            preds_G0 = [row[:K] for row, m in zip(cand_idx.tolist(), hit_mask) if m]
+            rows.append((split, "G0", f"Same queries as G, {retr_name} order without reranking",
+                         f"{args.cand_k} cands, positive present", int(hit_mask.sum()), *metrics(preds_G0, gt_G, K)))
 
     # ---- table ------------------------------------------------------------ #
     print()
