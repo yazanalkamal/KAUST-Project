@@ -6,7 +6,7 @@ model:
   type: "mlp"  # "mlp", "dcn", "wide_deep"
   
   # Input feature dimension (will be set based on feature builder)
-  input_dim: 5  # dot_uv, max_sim_recent, pop, hist_len, price_z
+  input_dim: 6  # dot_uv, max_sim_recent, pop, hist_len, price_z, retr_rr
   
   # Hidden layer dimensions
   hidden_dims: [384, 384, 192]
@@ -29,7 +29,7 @@ model:
 training:
   # Basic training parameters
   batch_size: 2048
-  epochs: 20
+  epochs: 40
   
   # Early stopping
   patience: 5
@@ -74,9 +74,11 @@ features:
   # Maximum history length for features
   max_history_length: 15
   
-  # Negative sampling for training
-  neg_per_query: 20
-  hard_negatives: true
+  # Negative sampling for training. null = keep every retrieved candidate as a
+  # negative. Do not use "hardest by similarity" negatives: with the positive
+  # anywhere in the list, that teaches the model that low similarity = positive.
+  neg_per_query: null
+  hard_negatives: false
   
   # Feature normalization
   normalize_features: false
@@ -88,17 +90,19 @@ features:
     - "pop"
     - "hist_len"
     - "price_z"
+    - "retr_rr"
 
 # Candidate generation configuration
 candidates:
   # Number of candidates to retrieve for reranking
-  retrieval_k: 100
-  
+  retrieval_k: 200
+
   # Batch size for candidate generation
   candidate_batch_size: 4096
-  
-  # Ensure positive items are included in candidates
-  include_positive: true
+
+  # The positive item is never inserted into candidate lists. Queries whose
+  # positive was not retrieved are dropped from reranker training.
+  include_positive: false
 
 # Data configuration
 data:

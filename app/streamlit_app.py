@@ -28,7 +28,10 @@ if str(abs_project_root) not in sys.path:
     sys.path.insert(0, str(abs_project_root))
 
 # Import our modules
-from src.data.features import RankingFeatureBuilder
+from src.data.features import RankingFeatureBuilder, build_item_side_features
+from src.inference.item_knn import ItemKNNRetriever, interactions_with_item_idx
+from src.models.reranker.mlp_ranker import MLPRanker
+from src.utils.config import load_config
 from src.utils.io import read_numpy
 
 # Set page config
@@ -276,42 +279,9 @@ body {
 </style>
 """, unsafe_allow_html=True)
 
-# Model definitions (compatible with saved weights)
-class FeatureDropDotUV(nn.Module):
-    def __init__(self, p):
-        super().__init__()
-        self.p = p
-    
-    def forward(self, X):
-        if not self.training or self.p <= 0:
-            return X
-        mask = (torch.rand(X.size(0), device=X.device) > self.p).float().unsqueeze(1)
-        X = X.clone()
-        X[:, 0:1] = X[:, 0:1] * mask
-        return X
-
-class RankerMLP(nn.Module):
-    def __init__(self, d_in, hidden=384, dropout=0.3, feature_drop_p=0.0):
-        super().__init__()
-        self.drop_dot = FeatureDropDotUV(feature_drop_p)
-        self.fc1 = nn.Linear(d_in, hidden)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.fc3 = nn.Linear(hidden, hidden//2)
-        self.out = nn.Linear(hidden//2, 1)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.ReLU()
-        self.ln1 = nn.LayerNorm(hidden)
-        self.ln2 = nn.LayerNorm(hidden)
-    
-    def forward(self, x):
-        x = self.drop_dot(x)
-        h1 = self.dropout(self.act(self.fc1(x)))
-        h1 = self.ln1(h1)
-        h2 = self.dropout(self.act(self.fc2(h1)))
-        h2 = self.ln2(h2)
-        h = h1 + h2
-        h = self.dropout(self.act(self.fc3(h)))
-        return self.out(h).squeeze(-1)
+# Reranker checkpoint written by scripts/train_reranker.py (src MLPRanker architecture)
+RERANKER_PATH = Path("models/reranker/best_ranker.pt")
+RERANKER_CONFIG = Path("configs/reranker.yaml")
 
 # Data loading functions
 @st.cache_resource
@@ -331,45 +301,26 @@ def load_embeddings() -> Tuple[np.ndarray, np.ndarray, str]:
     st.stop()
 
 @st.cache_resource
-def load_reranker() -> Tuple[RankerMLP, str]:
-    paths_to_try = [
-        Path("models/reranker/ranker_best.pt"),  # Try fc1/fc2/fc3 architecture first
-        Path("models/reranker/best_ranker.pt")   # Then try layers.X architecture
-    ]
-    
-    for path in paths_to_try:
-        if path.exists():
-            try:
-                model = RankerMLP(d_in=5, hidden=384, dropout=0.3, feature_drop_p=0.0)
-                state_dict = torch.load(path, map_location='cpu')
-                
-                # Check if this is the layers.X architecture and convert if needed
-                if 'layers.0.weight' in state_dict:
-                    # Convert from layers.X to fc1/fc2/fc3 format
-                    converted_state_dict = {}
-                    converted_state_dict['fc1.weight'] = state_dict['layers.0.weight']
-                    converted_state_dict['fc1.bias'] = state_dict['layers.0.bias']
-                    converted_state_dict['fc2.weight'] = state_dict['layers.1.weight']
-                    converted_state_dict['fc2.bias'] = state_dict['layers.1.bias']
-                    converted_state_dict['fc3.weight'] = state_dict['layers.2.weight']
-                    converted_state_dict['fc3.bias'] = state_dict['layers.2.bias']
-                    converted_state_dict['ln1.weight'] = state_dict['layer_norms.0.weight']
-                    converted_state_dict['ln1.bias'] = state_dict['layer_norms.0.bias']
-                    converted_state_dict['ln2.weight'] = state_dict['layer_norms.1.weight']
-                    converted_state_dict['ln2.bias'] = state_dict['layer_norms.1.bias']
-                    converted_state_dict['out.weight'] = state_dict['output_layer.weight']
-                    converted_state_dict['out.bias'] = state_dict['output_layer.bias']
-                    state_dict = converted_state_dict
-                
-                model.load_state_dict(state_dict)
-                model.eval()
-                return model, str(path)
-            except Exception as e:
-                st.warning(f"Failed to load {path}: {e}")
-                continue
-    
-    st.error("Could not find or load any trained reranker model in models/reranker/ directory.")
-    st.stop()
+def load_reranker() -> Tuple[MLPRanker, str]:
+    if not RERANKER_PATH.exists():
+        st.error(f"Reranker checkpoint not found: {RERANKER_PATH}. Run scripts/train_reranker.py first.")
+        st.stop()
+    model_cfg = load_config(RERANKER_CONFIG).get("model", {}) if RERANKER_CONFIG.exists() else {}
+    fd = model_cfg.get("feature_dropout", {})
+    model = MLPRanker(
+        input_dim=model_cfg.get("input_dim", 6),
+        hidden_dims=model_cfg.get("hidden_dims", [384, 384, 192]),
+        dropout=model_cfg.get("dropout", 0.3),
+        feature_dropout_indices=(fd.get("feature_indices", [0]) if fd.get("enabled", True) else None),
+        feature_dropout_prob=fd.get("dropout_prob", 0.3),
+        use_residual=model_cfg.get("use_residual", True),
+        use_layer_norm=model_cfg.get("use_layer_norm", True),
+        activation=model_cfg.get("activation", "relu"),
+    )
+    state_dict = torch.load(RERANKER_PATH, map_location="cpu", weights_only=True)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model, str(RERANKER_PATH)
 
 @st.cache_data
 def load_catalog_data() -> Dict[str, pd.DataFrame]:
@@ -388,12 +339,28 @@ def load_catalog_data() -> Dict[str, pd.DataFrame]:
                     "interactions": pd.read_parquet(data_dir / "interactions_clean.parquet"),
                     "customer_map": pd.read_parquet(data_dir / "customer_id_map.parquet"),
                     "item_map": pd.read_parquet(data_dir / "item_id_map.parquet"),
+                    "sequences_train": pd.read_parquet(data_dir / "sequences_train.parquet"),
                 }
         except Exception:
             continue
     
     st.error("Could not load catalog data from models/data or data/processed/jarir directories.")
     st.stop()
+
+@st.cache_resource
+def load_retriever(n_items: int) -> ItemKNNRetriever:
+    """ItemKNN fitted on the full purchase history. This is the serving
+    retriever; see scripts/evaluate.py for why it is used instead of the
+    Two-Tower embeddings (0.200 vs 0.056 Recall@10 on the test split)."""
+    data = load_catalog_data()
+    inter = interactions_with_item_idx(data["interactions"], data["item_map"])
+    return ItemKNNRetriever(n_items=n_items).fit(inter)
+
+@st.cache_resource
+def load_item_features(n_items: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Popularity and price_z vectors, built exactly as at reranker training time."""
+    data = load_catalog_data()
+    return build_item_side_features(data["sequences_train"], data["items"], data["item_map"], n_items)
 
 @st.cache_data
 def get_user_history(customer_id: int, interactions: pd.DataFrame, limit: int = 50) -> pd.DataFrame:
@@ -442,17 +409,18 @@ def build_user_vector_from_history(item_emb: np.ndarray, history: List[int], max
     n = np.linalg.norm(u) + 1e-8
     return (u / n).astype(np.float32)
 
-def get_candidates(user_vector: np.ndarray, item_embeddings: np.ndarray, k: int = 200) -> Tuple[np.ndarray, np.ndarray]:
-    similarities = user_vector @ item_embeddings.T
-    top_indices = np.argsort(similarities)[-k:][::-1]
-    top_scores = similarities[top_indices]
-    return top_indices, top_scores
+def get_candidates(history_chronological: List[int], n_items: int, k: int = 200) -> Tuple[np.ndarray, np.ndarray]:
+    """Retrieve k candidates for a purchase history, best first."""
+    retriever = load_retriever(n_items)
+    scores = retriever.score([history_chronological])[0]
+    top_indices = retriever.retrieve([history_chronological], k=k)[0]
+    return top_indices, scores[top_indices]
 
 def get_popular_items(items: pd.DataFrame, limit: int = 50) -> List[int]:
     return items.nlargest(limit, 'popularity').index.tolist()
 
 def rerank_candidates(candidates: np.ndarray, user_vector: np.ndarray, item_embeddings: np.ndarray,
-                     user_history: List[int], reranker: RankerMLP, 
+                     user_history: List[int], reranker: MLPRanker, 
                      items_df: Optional[pd.DataFrame] = None) -> Tuple[np.ndarray, np.ndarray]:
     if len(candidates) == 0:
         return np.array([]), np.array([])
@@ -465,21 +433,14 @@ def rerank_candidates(candidates: np.ndarray, user_vector: np.ndarray, item_embe
     )
     
     df = pd.DataFrame({
-        "history_idx": [" ".join(map(str, user_history[:15]))],
+        "history_idx": [" ".join(map(str, user_history[-15:]))],
         "pos_item_idx": [int(candidates[0])],
         "cands": [" ".join(map(str, candidates.tolist()))],
     })
     
-    popularity_scores = None
-    price_features = None
-    if items_df is not None:
-        try:
-            n_items = item_embeddings.shape[0]
-            popularity_scores = np.zeros(n_items)
-            price_features = np.zeros(n_items)
-        except Exception:
-            pass
-    
+    # Real item-side features; the model was trained with these, not zeros.
+    popularity_scores, price_features = load_item_features(item_embeddings.shape[0])
+
     features = feature_builder.build_features(
         df, 
         user_embeddings=np.array([user_vector]), 
@@ -490,7 +451,7 @@ def rerank_candidates(candidates: np.ndarray, user_vector: np.ndarray, item_embe
         batch_size=1024
     )
     
-    feature_cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z"]
+    feature_cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z", "retr_rr"]
     X = np.stack([features[col] for col in feature_cols], axis=-1)
     X_tensor = torch.from_numpy(X).float()
     
@@ -556,6 +517,12 @@ def main():
         )
     
     with col3:
+        use_reranker = st.checkbox(
+            "Use MLP reranker",
+            value=False,
+            help="Off by default: on the validation split the reranker scores 0.189 Recall@10 "
+                 "against 0.201 for the ItemKNN retriever alone. See scripts/evaluate.py.",
+        )
         get_recs = st.button("Get Recommendations", type="primary")
         if get_recs:
             # Clear any cached data to ensure fresh results
@@ -710,21 +677,31 @@ def main():
         else:
             user_item_indices = []
         
-        # Generate recommendations
+        # Generate recommendations. user_item_indices is most-recent-first; the
+        # retriever and the reranker features both expect chronological order.
         if user_item_indices:
-            user_vector = build_user_vector_from_history(item_embeddings, user_item_indices)
-            candidates, retrieval_scores = get_candidates(user_vector, item_embeddings, 200)
-            
+            history_chrono = list(reversed(user_item_indices))[-15:]
+            n_items = item_embeddings.shape[0]
+            candidates, retrieval_scores = get_candidates(history_chrono, n_items, 200)
+
             if len(candidates) == 0:
                 candidates = get_popular_items(data["items"], k)
                 candidates = np.array(candidates[:k])
                 scores = np.ones(len(candidates))
-            else:
-                candidates, scores = rerank_candidates(candidates, user_vector, item_embeddings, 
-                                                     user_item_indices, reranker, data["items"])
+                stage = "popularity"
+            elif use_reranker:
+                user_vector = build_user_vector_from_history(item_embeddings, user_item_indices)
+                candidates, scores = rerank_candidates(candidates, user_vector, item_embeddings,
+                                                       history_chrono, reranker, data["items"])
                 candidates = candidates[:k]
                 scores = scores[:k]
+                stage = "reranked"
+            else:
+                candidates = candidates[:k]
+                scores = retrieval_scores[:k]
+                stage = "retrieval"
         else:
+            stage = "popularity"
             candidates = get_popular_items(data["items"], k)
             candidates = np.array(candidates[:k])
             scores = np.ones(len(candidates))
@@ -734,14 +711,13 @@ def main():
         st.markdown(f'<div class="generation-time">⚡ Generated in {generation_time:.0f}ms</div>', unsafe_allow_html=True)
         st.success(f"✅ Successfully generated {len(candidates)} recommendations!")
         
-        # Debug: Show if reranker was used
-        if user_item_indices and len(candidates) > 0:
-            st.info(f"🧠 **Reranker Used**: Retrieved {200} candidates, reranked with MLP model, showing top {len(candidates)}")
-            # Show top 3 reranker scores for verification
-            if len(scores) >= 3:
-                st.markdown(f"**Top 3 Reranker Scores:** {scores[0]:.4f}, {scores[1]:.4f}, {scores[2]:.4f}")
+        # Which stage produced these results
+        if stage == "reranked":
+            st.info(f"🧠 **ItemKNN + MLP reranker**: retrieved 200 candidates, reranked, showing top {len(candidates)}")
+        elif stage == "retrieval":
+            st.info(f"🔍 **ItemKNN retriever**: showing top {len(candidates)} of 200 retrieved candidates")
         else:
-            st.warning(f"📊 **Popularity Fallback**: No user history available, showing popular items")
+            st.warning("📊 **Popularity fallback**: no purchase history for this customer")
         
         # Display recommendations
         if len(candidates) > 0:
@@ -878,20 +854,21 @@ def main():
     with col1:
         st.markdown(f"""
         <div style="background: #34495e; padding: 15px; border-radius: 8px; margin-bottom: 10px;">
-            <h5 style="color: #3498db; margin-bottom: 8px;">📊 Embeddings (Two-Tower Model)</h5>
-            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Path:</strong> {embeddings_path}</p>
-            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>User Embeddings:</strong> {user_embeddings.shape}</p>
-            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Item Embeddings:</strong> {item_embeddings.shape}</p>
+            <h5 style="color: #3498db; margin-bottom: 8px;">🔍 Retriever (ItemKNN)</h5>
+            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Model:</strong> item-item cosine over recency-weighted history</p>
+            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Test Recall@10:</strong> 0.200 over all {item_embeddings.shape[0]} items</p>
+            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Two-Tower embeddings:</strong> {embeddings_path} {item_embeddings.shape}, reranker features only</p>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
         st.markdown(f"""
         <div style="background: #34495e; padding: 15px; border-radius: 8px; margin-bottom: 10px;">
-            <h5 style="color: #e74c3c; margin-bottom: 8px;">🧠 Reranker (MLP Model)</h5>
+            <h5 style="color: #e74c3c; margin-bottom: 8px;">🧠 Reranker (MLP, optional)</h5>
             <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Path:</strong> {reranker_path}</p>
-            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Architecture:</strong> MLP (5 → 384 → 1)</p>
-            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Features:</strong> dot_uv, max_sim, pop, hist_len, price_z</p>
+            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Architecture:</strong> MLP (6 → 384 → 384 → 192 → 1)</p>
+            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Features:</strong> dot_uv, max_sim, pop, hist_len, price_z, retr_rr</p>
+            <p style="color: white; margin: 2px 0; font-size: 0.9rem;"><strong>Status:</strong> off by default; does not beat the retriever on validation</p>
         </div>
         """, unsafe_allow_html=True)
 

@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.data.dataset import load_id_mappings
-from src.data.features import RankingFeatureBuilder
+from src.data.features import RankingFeatureBuilder, build_item_side_features, positive_in_candidates
 from src.models.reranker.mlp_ranker import MLPRanker
 from src.training.trainer import RankingTrainer, setup_training
 from src.training.callbacks import EarlyStopping, ModelCheckpoint, MetricsLogger
@@ -73,7 +73,7 @@ def make_feature_tensors(
     feats = feature_builder.build_features(
         df, user_emb, item_emb, pop, price, device=str(device), batch_size=1024,
     )
-    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z"]
+    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z", "retr_rr"]
     # Stack features into (Q, K, F) then flatten to (Q*K, F)
     X_np = np.stack([feats[c] for c in cols], axis=-1)
     X_np = X_np.reshape(-1, X_np.shape[-1])
@@ -114,17 +114,30 @@ class ValRecallCallback:
         return None
 
     def on_epoch_end(self, epoch: int, logs=None) -> bool:
+        was_training = self.model.training
+        self.model.eval()
         with torch.no_grad():
             scores = self.model(self.X_val_flat).view(self.batch_count, self.k_per_q).cpu()
+        if was_training:
+            self.model.train()
         # Labels shaped (B,K2) with exactly one positive per row
         y = self.y_val_flat.view(self.batch_count, self.k_per_q).cpu()
         topk_idx = torch.topk(scores, k=min(self.topk, self.k_per_q), dim=1).indices
-        # For each row, check if any top-k position corresponds to label==1
         rows = torch.arange(self.batch_count).unsqueeze(1)
-        hits = (y[rows, topk_idx] > 0.5).any(dim=1).float().mean().item()
-        rec = float(hits)
-        logging.getLogger(__name__).info(f"Epoch {epoch+1}: val_recall@{self.topk}={rec:.4f}")
-        # Do not stop training
+        hit = (y[rows, topk_idx] > 0.5).any(dim=1).float()
+        rec = float(hit.mean().item())
+        # NDCG with a single relevant item: 1/log2(rank+1).
+        pos_rank = (y[rows, topk_idx] > 0.5).float().argmax(dim=1) + 1
+        ndcg = float((hit / torch.log2(pos_rank.float() + 1.0)).mean().item())
+        logging.getLogger(__name__).info(
+            f"Epoch {epoch+1}: val_recall@{self.topk}={rec:.4f} val_ndcg@{self.topk}={ndcg:.4f}"
+        )
+        # Publish into the shared log dict so ModelCheckpoint and EarlyStopping
+        # can select on ranking quality instead of BCE loss. This callback is
+        # registered first so the metric is present when they run.
+        if logs is not None:
+            logs[f"val_recall@{self.topk}"] = rec
+            logs[f"val_ndcg@{self.topk}"] = ndcg
         return False
 
 
@@ -154,7 +167,7 @@ def main() -> None:
     device = torch.device(get_device() if device_str == "auto" else device_str)
     logger.info(f"Using device: {device}")
 
-    data_dir = Path(cfg.get("data_dir", "data/processed/jarir"))
+    data_dir = Path(cfg.get("data_dir", "models/data"))
     model_dir = Path(cfg.get("model_dir", "models/reranker"))
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -171,14 +184,27 @@ def main() -> None:
         item_emb = read_numpy(retriever_dir_fallback / "item_embeddings.npy")
     logger.info(f"Loaded embeddings: users {user_emb.shape}, items {item_emb.shape}")
 
-    # Optional features (popularity/price) — keep simple placeholders for now
-    pop = None
-    price = None
+    # Item-side features. The same function is used at inference time (app, evaluate.py)
+    # so the model is scored on the features it was trained with.
+    item_map, _ = load_id_mappings(data_dir)
+    seq_train = pd.read_parquet(data_dir / "sequences_train.parquet")
+    items_clean = pd.read_parquet(data_dir / "items_clean.parquet")
+    pop, price = build_item_side_features(seq_train, items_clean, item_map, n_items=item_emb.shape[0])
+    logger.info(f"Item features: pop non-zero for {int((pop > 0).sum())} items, price_z for {int((price != 0).sum())} items")
 
     # Load candidates
     cand = load_candidates(data_dir)
     if "train" not in cand or "val" not in cand:
         raise FileNotFoundError("candidates_train.parquet and candidates_val.parquet are required")
+
+    # A pointwise ranker needs one positive per list to learn from. Keep only the
+    # queries whose positive the retriever actually returned; never insert it.
+    for split in list(cand.keys()):
+        mask = positive_in_candidates(cand[split])
+        logger.info(f"{split}: positive retrieved in {int(mask.sum())}/{len(mask)} candidate lists; keeping those")
+        cand[split] = cand[split][mask].reset_index(drop=True)
+    if len(cand["train"]) == 0 or len(cand["val"]) == 0:
+        raise ValueError("No candidate lists contain the positive item; check the retriever")
 
     # Feature builder
     fb_cfg = cfg.get("features", {})
@@ -200,7 +226,7 @@ def main() -> None:
         n_negatives_per_query=None,
     )
     feats_val = val_feat_builder.build_features(cand["val"], user_emb, item_emb, pop, price, device=str(device), batch_size=1024)
-    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z"]
+    cols = ["dot_uv", "max_sim_recent", "pop", "hist_len", "price_z", "retr_rr"]
     X_va_np = np.stack([feats_val[c] for c in cols], axis=-1)
     X_va_np = X_va_np.reshape(-1, X_va_np.shape[-1])
     y_va_np = feats_val["label"].reshape(-1)
@@ -222,7 +248,7 @@ def main() -> None:
     # Model
     model_cfg = cfg.get("model", {})
     model = MLPRanker(
-        input_dim=model_cfg.get("input_dim", 5),
+        input_dim=model_cfg.get("input_dim", 6),
         hidden_dims=model_cfg.get("hidden_dims", [384, 384, 192]),
         dropout=model_cfg.get("dropout", 0.3),
         feature_dropout_indices=(model_cfg.get("feature_dropout", {}).get("feature_indices", [0]) if model_cfg.get("feature_dropout", {}).get("enabled", True) else None),
@@ -245,16 +271,23 @@ def main() -> None:
         mixed_precision=(device.type == "cuda" and cfg.get("training", {}).get("mixed_precision", True)),
     )
 
-    # Callbacks
-    # Notebook default: save best to models/reranker/best_ranker.pt
-    ckpt = ModelCheckpoint(filepath=model_dir / "best_ranker.pt", monitor="val_loss", mode="min", save_best_only=True, save_weights_only=True)
-    ckpt.set_model(model)
-    trainer.add_callback(ckpt)
-    trainer.add_callback(EarlyStopping(monitor="val_loss", patience=cfg.get("training", {}).get("patience", 5), mode="min"))
-    trainer.add_callback(MetricsLogger(save_path=model_dir / "training_metrics.json", save_frequency=5))
-    # Add validation Recall@K printer (fast, precomputed features)
+    # Callbacks. Registration order matters: the ranking metric must be computed
+    # and written into the epoch logs before checkpointing and early stopping
+    # read it, so ValRecallCallback is registered first.
     eval_topk = int(cfg.get("evaluation", {}).get("eval_topk", 10))
     trainer.add_callback(ValRecallCallback(model, X_va, y_va, batch_count_va, k_per_q_va, device, topk=eval_topk))
+
+    ckpt_cfg = cfg.get("checkpointing", {})
+    monitor = ckpt_cfg.get("monitor", f"val_recall@{eval_topk}")
+    mode = ckpt_cfg.get("mode", "max")
+    ckpt = ModelCheckpoint(filepath=model_dir / "best_ranker.pt", monitor=monitor, mode=mode,
+                           save_best_only=True, save_weights_only=True)
+    ckpt.set_model(model)
+    trainer.add_callback(ckpt)
+    trainer.add_callback(EarlyStopping(monitor=monitor, mode=mode,
+                                       patience=cfg.get("training", {}).get("patience", 5)))
+    trainer.add_callback(MetricsLogger(save_path=model_dir / "training_metrics.json", save_frequency=5))
+    logging.getLogger(__name__).info(f"Selecting the checkpoint on {monitor} ({mode})")
 
     # Train
     epochs = int(cfg.get("training", {}).get("epochs", 20))
