@@ -26,6 +26,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+from src.inference.item_knn import interactions_with_item_idx, time_aware_topk
 from src.utils.io import read_numpy
 from src.utils.logging import setup_logging
 
@@ -36,6 +37,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", type=str, default="models/data", help="Processed data directory")
     p.add_argument("--emb-dir", type=str, default="models/retriever", help="Directory with user/item embeddings")
     p.add_argument("--k", type=int, default=200, help="Candidates per query")
+    p.add_argument("--retriever", type=str, default="item_knn", choices=["item_knn", "two_tower"],
+                   help="item_knn: item-item cosine fitted on purchases before each query date; "
+                        "two_tower: history-mean of Two-Tower item embeddings")
     p.add_argument("--batch", type=int, default=4096, help="Batch size for retrieval")
     p.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     return p.parse_args()
@@ -113,9 +117,27 @@ def main() -> None:
                     rows.append((h, int(pos), " ".join(map(str,cands)), str(df['ts'].iloc[i+j]) if 'ts' in df.columns else ""))
         return pd.DataFrame(rows, columns=["history_idx","pos_item_idx","cands","ts"]) 
 
+    def build_for_split_knn(df: pd.DataFrame) -> pd.DataFrame:
+        if len(df) == 0:
+            return pd.DataFrame(columns=["history_idx","pos_item_idx","cands","ts"])
+        hists = []
+        for s in df['history_idx'].astype(str).tolist():
+            h = [int(x) for x in s.split() if x.strip()] if s and s != "nan" else []
+            hists.append(h[-L:])
+        topk = time_aware_topk(inter, df['ts'].tolist(), hists, n_items=item_emb.shape[0], k=K)
+        rows = [(h_s, int(pos), " ".join(map(str, topk[j].tolist())), str(df['ts'].iloc[j]))
+                for j, (pos, h_s) in enumerate(zip(df['pos_item_idx'].astype(int).tolist(),
+                                                   df['history_idx'].astype(str).tolist()))]
+        return pd.DataFrame(rows, columns=["history_idx","pos_item_idx","cands","ts"])
+
+    if args.retriever == "item_knn":
+        item_map = pd.read_parquet(data_dir / "item_id_map.parquet")
+        inter = interactions_with_item_idx(pd.read_parquet(data_dir / "interactions_clean.parquet"), item_map)
+        logger.info("ItemKNN retriever: %d purchase rows available", len(inter))
+
     for split in ["train","val","test"]:
-        logger.info("Building candidates for %s", split)
-        out = build_for_split(seq[split])
+        logger.info("Building candidates for %s with %s", split, args.retriever)
+        out = build_for_split_knn(seq[split]) if args.retriever == "item_knn" else build_for_split(seq[split])
         out_path = data_dir / f"candidates_{split}.parquet"
         out.to_parquet(out_path, index=False)
         present = float(np.mean([str(p) in c.split() for p, c in zip(out["pos_item_idx"], out["cands"])])) if len(out) else 0.0
