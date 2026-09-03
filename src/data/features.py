@@ -304,6 +304,50 @@ def create_id_mappings(
     return item_map, customer_map
 
 
+def build_item_side_features(
+    seq_train: pd.DataFrame,
+    items_clean: pd.DataFrame,
+    item_map: pd.DataFrame,
+    n_items: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Item-level feature vectors used by the reranker: popularity and price z-score.
+
+    - pop: number of times each item is the positive in the training sequences,
+      min-max normalised to [0, 1]; 0 for items never purchased in training.
+    - price_z: z-score of items_clean.price_median over the catalogue; 0 if missing.
+
+    The same function must be used at training and at inference time so the
+    reranker sees the features it was trained on.
+
+    Returns:
+        Tuple of (pop, price_z), each a float32 array of length n_items indexed by item_idx.
+    """
+    pop_counts = seq_train['pos_item_idx'].value_counts()
+    pop = np.zeros(n_items, dtype=np.float32)
+    if len(pop_counts) > 0:
+        pop_norm = (pop_counts - pop_counts.min()) / (pop_counts.max() - pop_counts.min() + 1e-9)
+        pop[pop_counts.index.values.astype(int)] = pop_norm.values.astype(np.float32)
+
+    price_z = np.zeros(n_items, dtype=np.float32)
+    if 'price_median' in items_clean.columns:
+        m = items_clean[['stock_code', 'price_median']].dropna().merge(item_map, on='stock_code', how='inner')
+        if len(m) > 0:
+            mu, sigma = m['price_median'].mean(), m['price_median'].std() + 1e-6
+            z = ((m['price_median'] - mu) / sigma).astype(float)
+            price_z[m['item_idx'].astype(int).values] = z.values.astype(np.float32)
+
+    return pop, price_z
+
+
+def positive_in_candidates(candidates_df: pd.DataFrame) -> np.ndarray:
+    """Boolean mask: True where the query's positive item appears in its candidate list."""
+    return np.array(
+        [str(int(p)) in c.split() for p, c in zip(candidates_df['pos_item_idx'], candidates_df['cands'])],
+        dtype=bool,
+    )
+
+
 class RankingFeatureBuilder:
     """
     Builder for ranking features used in the MLP reranker.

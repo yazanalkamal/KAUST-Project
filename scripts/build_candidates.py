@@ -4,11 +4,14 @@ Build candidate lists from Two-Tower embeddings (notebook-aligned).
 
 This script loads sequences_{train,val,test}.parquet and the exported
 user/item embeddings, computes user vectors from history, retrieves
-top-K items per query, ensures the positive item is present,
-and writes candidates_{split}.parquet.
+top-K items per query, and writes candidates_{split}.parquet.
+
+The positive item is NOT inserted into the list when the retriever misses it.
+Doing so (as earlier versions did) teaches the reranker to spot the inserted
+item and makes candidate-level metrics meaningless.
 
 Example:
-  python scripts/build_candidates.py --data-dir data/processed/jarir --k 100
+  python scripts/build_candidates.py --data-dir models/data --k 200
 """
 
 import argparse
@@ -30,9 +33,9 @@ from src.utils.logging import setup_logging
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build candidate lists from embeddings",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--data-dir", type=str, default="data/processed/jarir", help="Processed data directory")
+    p.add_argument("--data-dir", type=str, default="models/data", help="Processed data directory")
     p.add_argument("--emb-dir", type=str, default="models/retriever", help="Directory with user/item embeddings")
-    p.add_argument("--k", type=int, default=100, help="Candidates per query")
+    p.add_argument("--k", type=int, default=200, help="Candidates per query")
     p.add_argument("--batch", type=int, default=4096, help="Batch size for retrieval")
     p.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
     return p.parse_args()
@@ -107,8 +110,6 @@ def main() -> None:
                 for j, (pos, h) in enumerate(zip(df['pos_item_idx'].iloc[i:i+ BQ].astype(int).tolist(),
                                                  df['history_idx'].iloc[i:i+ BQ].astype(str).tolist())):
                     cands = topk[j].tolist()
-                    if pos not in cands:
-                        cands[-1] = int(pos)
                     rows.append((h, int(pos), " ".join(map(str,cands)), str(df['ts'].iloc[i+j]) if 'ts' in df.columns else ""))
         return pd.DataFrame(rows, columns=["history_idx","pos_item_idx","cands","ts"]) 
 
@@ -117,7 +118,8 @@ def main() -> None:
         out = build_for_split(seq[split])
         out_path = data_dir / f"candidates_{split}.parquet"
         out.to_parquet(out_path, index=False)
-        logger.info("Saved %s (%d rows)", out_path, len(out))
+        present = float(np.mean([str(p) in c.split() for p, c in zip(out["pos_item_idx"], out["cands"])])) if len(out) else 0.0
+        logger.info("Saved %s (%d rows); positive retrieved in %.1f%% of lists (Recall@%d)", out_path, len(out), 100 * present, K)
 
 
 if __name__ == "__main__":
