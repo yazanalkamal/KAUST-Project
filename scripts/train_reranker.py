@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.data.dataset import load_id_mappings
-from src.data.features import RankingFeatureBuilder
+from src.data.features import RankingFeatureBuilder, build_item_side_features, positive_in_candidates
 from src.models.reranker.mlp_ranker import MLPRanker
 from src.training.trainer import RankingTrainer, setup_training
 from src.training.callbacks import EarlyStopping, ModelCheckpoint, MetricsLogger
@@ -154,7 +154,7 @@ def main() -> None:
     device = torch.device(get_device() if device_str == "auto" else device_str)
     logger.info(f"Using device: {device}")
 
-    data_dir = Path(cfg.get("data_dir", "data/processed/jarir"))
+    data_dir = Path(cfg.get("data_dir", "models/data"))
     model_dir = Path(cfg.get("model_dir", "models/reranker"))
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -171,14 +171,27 @@ def main() -> None:
         item_emb = read_numpy(retriever_dir_fallback / "item_embeddings.npy")
     logger.info(f"Loaded embeddings: users {user_emb.shape}, items {item_emb.shape}")
 
-    # Optional features (popularity/price) — keep simple placeholders for now
-    pop = None
-    price = None
+    # Item-side features. The same function is used at inference time (app, evaluate.py)
+    # so the model is scored on the features it was trained with.
+    item_map, _ = load_id_mappings(data_dir)
+    seq_train = pd.read_parquet(data_dir / "sequences_train.parquet")
+    items_clean = pd.read_parquet(data_dir / "items_clean.parquet")
+    pop, price = build_item_side_features(seq_train, items_clean, item_map, n_items=item_emb.shape[0])
+    logger.info(f"Item features: pop non-zero for {int((pop > 0).sum())} items, price_z for {int((price != 0).sum())} items")
 
     # Load candidates
     cand = load_candidates(data_dir)
     if "train" not in cand or "val" not in cand:
         raise FileNotFoundError("candidates_train.parquet and candidates_val.parquet are required")
+
+    # A pointwise ranker needs one positive per list to learn from. Keep only the
+    # queries whose positive the retriever actually returned; never insert it.
+    for split in list(cand.keys()):
+        mask = positive_in_candidates(cand[split])
+        logger.info(f"{split}: positive retrieved in {int(mask.sum())}/{len(mask)} candidate lists; keeping those")
+        cand[split] = cand[split][mask].reset_index(drop=True)
+    if len(cand["train"]) == 0 or len(cand["val"]) == 0:
+        raise ValueError("No candidate lists contain the positive item; check the retriever")
 
     # Feature builder
     fb_cfg = cfg.get("features", {})
