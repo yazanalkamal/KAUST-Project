@@ -83,12 +83,22 @@ class ItemKNNRetriever:
         return profiles @ self.similarity
 
     def retrieve(self, histories: Iterable[Sequence[int]], k: int) -> np.ndarray:
-        """Top-k item indices per history, best first. Returns an (n_queries, k) array."""
+        """
+        Top-k item indices per history, best first. Returns an (n_queries, k) array.
+
+        Ties break by ascending item_idx. Scores tie constantly here: an item
+        the query history never co-occurs with scores exactly 0, and short
+        histories leave hundreds of items tied just below the top. A stable
+        sort over the whole score row keeps index order among equal scores, so
+        retrieve(h, 10) is always the first 10 of retrieve(h, 200).
+
+        The previous argpartition version broke ties by partition order, which
+        depends on k: retrieving 10 directly and slicing 10 out of 200 gave
+        different lists and moved NDCG@10 by ~0.01. Sorting 1,735 items per
+        query costs nothing at this scale.
+        """
         scores = self.score(histories)
-        k = min(k, self.n_items)
-        part = np.argpartition(-scores, k - 1, axis=1)[:, :k]
-        order = np.argsort(-np.take_along_axis(scores, part, axis=1), axis=1, kind="stable")
-        return np.take_along_axis(part, order, axis=1)
+        return np.argsort(-scores, axis=1, kind="stable")[:, : min(k, self.n_items)]
 
 
 def interactions_with_item_idx(interactions: pd.DataFrame, item_map: pd.DataFrame) -> pd.DataFrame:

@@ -95,3 +95,63 @@ def test_metrics_agree_with_hand_computed_values():
     assert recall_at_k(preds, gt, 3) == pytest.approx(0.5)
     # hit at rank 2 in the first list, miss in the second
     assert ndcg_at_k(preds, gt, 3) == pytest.approx(0.5 / np.log2(3))
+
+
+def test_random_baseline_scores_chance_level():
+    """
+    A uniform-random top-10 must score K/n_items and nothing more. If it scores
+    higher, the evaluator is crediting hits it should not (a shrunken ranked
+    set, a positive leaking into the list, a metric counting partial matches).
+
+    One seed is not a test: the test split expects 160 * 10/1735 = 0.9 hits, so
+    a single draw scores 0.000 about 40% of the time. Average over many seeds
+    and check the mean against its own standard error.
+    """
+    item_map = _read("item_id_map.parquet")
+    gt = _read("sequences_test.parquet")["pos_item_idx"].astype(int).tolist()
+    n_items, k, n_seeds = len(item_map), 10, 200
+
+    recalls = []
+    for seed in range(n_seeds):
+        draw = np.random.default_rng(seed).random((len(gt), n_items))
+        preds = np.argpartition(draw, k, axis=1)[:, :k].tolist()
+        recalls.append(recall_at_k(preds, gt, k))
+
+    recalls = np.array(recalls)
+    expected = k / n_items
+    se = recalls.std(ddof=1) / np.sqrt(n_seeds)
+    assert abs(recalls.mean() - expected) < 3 * se, (
+        f"Random Recall@{k} averaged {recalls.mean():.4f} over {n_seeds} seeds, expected "
+        f"{expected:.4f} (= {k}/{n_items}), 3 SE = {3 * se:.4f}. The evaluator is scoring "
+        "a random list off chance level."
+    )
+
+
+def test_ranking_is_deterministic_and_depth_independent():
+    """
+    Scores tie heavily here (every item the history never co-occurs with scores
+    exactly 0), so the tie-break decides the top-10. It must be score desc then
+    item_idx asc, which makes the top-k a prefix of any deeper retrieval. An
+    argpartition-based tie-break is k-dependent and moved NDCG@10 by ~0.01
+    depending on how deep scripts/evaluate.py happened to retrieve.
+    """
+    item_map = _read("item_id_map.parquet")
+    inter = interactions_with_item_idx(_read("interactions_clean.parquet"), item_map)
+    seq = _read("sequences_test.parquet")
+    hists = [[int(x) for x in str(h).split()][-15:] for h in seq["history_idx"]]
+    knn = ItemKNNRetriever(n_items=len(item_map)).fit(inter[inter["invoice_date"] < seq["ts"].min()])
+
+    deep = knn.retrieve(hists, k=len(item_map))
+    for k in (10, 50, 200):
+        assert np.array_equal(knn.retrieve(hists, k=k), deep[:, :k]), (
+            f"retrieve(k={k}) is not the first {k} columns of a full-catalogue retrieve; "
+            "the tie-break depends on k."
+        )
+
+    scores = knn.score(hists)
+    for i in range(len(hists)):
+        row = deep[i]
+        ordered = scores[i][row]
+        assert np.all(np.diff(ordered) <= 0), "not sorted by score descending"
+        tied = np.flatnonzero(np.diff(ordered) == 0)
+        assert np.all(row[tied + 1] > row[tied]), "ties are not broken by ascending item_idx"
